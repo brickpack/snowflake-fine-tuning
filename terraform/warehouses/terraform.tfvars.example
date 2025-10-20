@@ -1,0 +1,82 @@
+# Example Warehouse Configurations
+# Copy this file to terraform.tfvars and customize for your environment
+
+warehouses = {
+  # Production analytics warehouse with multi-cluster
+  "ANALYTICS_PROD" = {
+    comment           = "Production analytics workloads"
+    size              = "LARGE"
+    min_cluster_count = 1
+    max_cluster_count = 3
+    scaling_policy    = "ECONOMY"
+    auto_suspend      = 300  # 5 minutes
+    auto_resume       = true
+    resource_monitor  = "ANALYTICS_MONITOR"
+    statement_timeout = 3600 # 1 hour
+    tags = {
+      environment    = "prod"
+      cost_center    = "analytics"
+      owner          = "analytics-team"
+      data_classification = "internal"
+    }
+  }
+
+  # ETL processing warehouse
+  "ETL_WH" = {
+    comment           = "ETL and data pipeline processing"
+    size              = "X-LARGE"
+    min_cluster_count = 1
+    max_cluster_count = 1
+    auto_suspend      = 600  # 10 minutes
+    auto_resume       = true
+    resource_monitor  = "ETL_MONITOR"
+    tags = {
+      environment    = "prod"
+      cost_center    = "engineering"
+      owner          = "data-eng-team"
+    }
+  }
+
+  # Development warehouse
+  "DEV_WH" = {
+    comment      = "Development and testing"
+    size         = "SMALL"
+    auto_suspend = 180  # 3 minutes
+    auto_resume  = true
+    tags = {
+      environment = "dev"
+      cost_center = "engineering"
+    }
+  }
+
+  # Ad-hoc analysis warehouse
+  "ADHOC_WH" = {
+    comment      = "Ad-hoc queries and exploration"
+    size         = "MEDIUM"
+    auto_suspend = 300
+    auto_resume  = true
+    tags = {
+      environment = "prod"
+      cost_center = "analytics"
+    }
+  }
+}
+
+# Resource monitors for cost control
+resource_monitors = {
+  "ANALYTICS_MONITOR" = {
+    credit_quota    = 1000
+    frequency       = "MONTHLY"
+    notify_triggers = [80, 90, 100]
+    suspend_triggers = [100]
+    notify_users    = ["admin@example.com"]
+  }
+
+  "ETL_MONITOR" = {
+    credit_quota    = 2000
+    frequency       = "MONTHLY"
+    notify_triggers = [75, 90, 100]
+    suspend_triggers = [100]
+    notify_users    = ["admin@example.com"]
+  }
+}
