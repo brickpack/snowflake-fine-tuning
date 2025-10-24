@@ -29,18 +29,70 @@ class SnowflakeConnection:
     """Manages Snowflake database connections with connection pooling."""
 
     def __init__(self):
+        # Get authenticator type (default to password-based)
+        authenticator = os.getenv('SNOWFLAKE_AUTHENTICATOR', 'snowflake')
+
         self.connection_params = {
             'account': os.getenv('SNOWFLAKE_ACCOUNT'),
             'user': os.getenv('SNOWFLAKE_USER'),
-            'password': os.getenv('SNOWFLAKE_PASSWORD'),
             'role': os.getenv('SNOWFLAKE_ROLE', 'ACCOUNTADMIN'),
             'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
             'database': os.getenv('SNOWFLAKE_DATABASE'),
             'schema': os.getenv('SNOWFLAKE_SCHEMA', 'PUBLIC'),
         }
 
+        # Add authentication method based on authenticator type
+        if authenticator == 'snowflake_jwt' or os.getenv('SNOWFLAKE_PRIVATE_KEY_PATH'):
+            # Use key-pair authentication
+            private_key_path = os.getenv('SNOWFLAKE_PRIVATE_KEY_PATH')
+            private_key_passphrase = os.getenv('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE')
+
+            if not private_key_path:
+                raise ValueError("SNOWFLAKE_PRIVATE_KEY_PATH is required for key-pair authentication")
+
+            try:
+                from cryptography.hazmat.backends import default_backend
+                from cryptography.hazmat.primitives import serialization
+
+                with open(private_key_path, 'rb') as key_file:
+                    if private_key_passphrase:
+                        p_key = serialization.load_pem_private_key(
+                            key_file.read(),
+                            password=private_key_passphrase.encode(),
+                            backend=default_backend()
+                        )
+                    else:
+                        p_key = serialization.load_pem_private_key(
+                            key_file.read(),
+                            password=None,
+                            backend=default_backend()
+                        )
+
+                    pkb = p_key.private_bytes(
+                        encoding=serialization.Encoding.DER,
+                        format=serialization.PrivateFormat.PKCS8,
+                        encryption_algorithm=serialization.NoEncryption()
+                    )
+                    self.connection_params['private_key'] = pkb
+                    logger.info("Using key-pair authentication")
+            except Exception as e:
+                raise ValueError(f"Failed to load private key from {private_key_path}: {e}")
+
+            required = ['account', 'user']
+        elif authenticator == 'externalbrowser':
+            # Use browser-based SSO authentication (supports MFA)
+            self.connection_params['authenticator'] = 'externalbrowser'
+            logger.info("Using browser-based SSO authentication")
+            required = ['account', 'user']
+        else:
+            # Use password authentication (default)
+            password = os.getenv('SNOWFLAKE_PASSWORD')
+            if password:
+                self.connection_params['password'] = password
+            logger.info("Using password-based authentication")
+            required = ['account', 'user', 'password']
+
         # Validate required parameters
-        required = ['account', 'user', 'password']
         missing = [k for k in required if not self.connection_params.get(k)]
         if missing:
             raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
@@ -115,7 +167,8 @@ def get_warehouse_credit_cost() -> float:
 
 def calculate_cost(credits_used: float) -> float:
     """Calculate dollar cost from credits used."""
-    return credits_used * get_warehouse_credit_cost()
+    # Convert to float to handle Decimal types from Snowflake
+    return float(credits_used) * get_warehouse_credit_cost()
 
 
 def format_currency(amount: float) -> str:
@@ -213,31 +266,41 @@ def get_warehouse_cost_summary(days: int = 30) -> str:
 
 
 def get_idle_warehouse_query(idle_threshold_minutes: int = 30) -> str:
-    """Generate query to find idle warehouses."""
+    """Generate query to find idle warehouses using available views."""
     return f"""
-    SELECT
-        w.name as warehouse_name,
-        w.size as warehouse_size,
-        w.auto_suspend as auto_suspend_seconds,
-        w.auto_resume as auto_resume_enabled,
-        w.state as current_state,
-        DATEDIFF(minute, wm.last_usage, CURRENT_TIMESTAMP()) as minutes_since_last_use,
-        wm.total_credits
-    FROM snowflake.account_usage.warehouses w
-    LEFT JOIN (
+    WITH warehouse_usage AS (
         SELECT
             warehouse_name,
             MAX(end_time) as last_usage,
-            SUM(credits_used) as total_credits
+            SUM(credits_used) as total_credits,
+            COUNT(DISTINCT DATE_TRUNC('day', start_time)) as active_days
         FROM snowflake.account_usage.warehouse_metering_history
         WHERE start_time >= DATEADD(day, -7, CURRENT_TIMESTAMP())
         GROUP BY warehouse_name
-    ) wm ON w.name = wm.warehouse_name
-    WHERE w.deleted IS NULL
-        AND (
-            wm.last_usage IS NULL
-            OR DATEDIFF(minute, wm.last_usage, CURRENT_TIMESTAMP()) > {idle_threshold_minutes}
-        )
+    ),
+    warehouse_metadata AS (
+        SELECT
+            qh.warehouse_name,
+            MAX(qh.warehouse_size) as warehouse_size,
+            MAX(qh.start_time) as last_query_time
+        FROM snowflake.account_usage.query_history qh
+        WHERE qh.start_time >= DATEADD(day, -7, CURRENT_TIMESTAMP())
+            AND qh.warehouse_name IS NOT NULL
+        GROUP BY qh.warehouse_name
+    )
+    SELECT
+        COALESCE(wu.warehouse_name, wm.warehouse_name) as warehouse_name,
+        COALESCE(wm.warehouse_size, 'UNKNOWN') as warehouse_size,
+        NULL as auto_suspend_seconds,
+        NULL as auto_resume_enabled,
+        'UNKNOWN' as current_state,
+        DATEDIFF(minute, GREATEST(COALESCE(wu.last_usage, '1970-01-01'), COALESCE(wm.last_query_time, '1970-01-01')), CURRENT_TIMESTAMP()) as minutes_since_last_use,
+        COALESCE(wu.total_credits, 0) as total_credits
+    FROM warehouse_usage wu
+    FULL OUTER JOIN warehouse_metadata wm
+        ON wu.warehouse_name = wm.warehouse_name
+    WHERE DATEDIFF(minute, GREATEST(COALESCE(wu.last_usage, '1970-01-01'), COALESCE(wm.last_query_time, '1970-01-01')), CURRENT_TIMESTAMP()) > {idle_threshold_minutes}
+        OR (wu.last_usage IS NULL AND wm.last_query_time IS NULL)
     ORDER BY minutes_since_last_use DESC NULLS FIRST
     """
 
