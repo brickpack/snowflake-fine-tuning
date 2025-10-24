@@ -70,27 +70,31 @@ def analyze_auto_suspend_settings(sf: SnowflakeConnection) -> pd.DataFrame:
     logger.info("Analyzing auto-suspend settings...")
 
     query = """
-    WITH recent_usage AS (
+    WITH query_gaps AS (
         SELECT
             warehouse_name,
-            COUNT(*) as query_count,
-            AVG(DATEDIFF(second,
+            start_time,
+            DATEDIFF(second,
                 LAG(start_time) OVER (PARTITION BY warehouse_name ORDER BY start_time),
                 start_time
-            )) as avg_seconds_between_queries,
-            PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY DATEDIFF(second,
-                LAG(start_time) OVER (PARTITION BY warehouse_name ORDER BY start_time),
-                start_time
-            )) as median_seconds_between_queries
+            ) as seconds_since_last_query
         FROM snowflake.account_usage.query_history
         WHERE start_time >= DATEADD(day, -7, CURRENT_TIMESTAMP())
             AND warehouse_name IS NOT NULL
+    ),
+    recent_usage AS (
+        SELECT
+            warehouse_name,
+            COUNT(*) as query_count,
+            AVG(seconds_since_last_query) as avg_seconds_between_queries,
+            PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY seconds_since_last_query) as median_seconds_between_queries
+        FROM query_gaps
+        WHERE seconds_since_last_query IS NOT NULL
         GROUP BY warehouse_name
     ),
     idle_time_waste AS (
         SELECT
             wm.warehouse_name,
-            wm.warehouse_size,
             SUM(CASE
                 WHEN wm.credits_used_compute = 0
                     AND wm.credits_used_cloud_services > 0
@@ -99,26 +103,35 @@ def analyze_auto_suspend_settings(sf: SnowflakeConnection) -> pd.DataFrame:
             END) as idle_credits_last_7d
         FROM snowflake.account_usage.warehouse_metering_history wm
         WHERE wm.start_time >= DATEADD(day, -7, CURRENT_TIMESTAMP())
-        GROUP BY wm.warehouse_name, wm.warehouse_size
+        GROUP BY wm.warehouse_name
+    ),
+    warehouse_metadata AS (
+        SELECT
+            warehouse_name,
+            MAX(warehouse_size) as warehouse_size,
+            MIN(start_time) as first_seen
+        FROM snowflake.account_usage.query_history
+        WHERE start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+            AND warehouse_name IS NOT NULL
+        GROUP BY warehouse_name
     )
     SELECT
-        w.name as warehouse_name,
-        w.size as warehouse_size,
-        w.auto_suspend as auto_suspend_seconds,
-        w.auto_resume as auto_resume_enabled,
-        w.state as current_state,
-        w.comment as warehouse_comment,
-        ru.query_count as queries_last_7d,
+        COALESCE(wm.warehouse_name, ru.warehouse_name, itw.warehouse_name) as warehouse_name,
+        COALESCE(wm.warehouse_size, 'UNKNOWN') as warehouse_size,
+        NULL as auto_suspend_seconds,
+        NULL as auto_resume_enabled,
+        'UNKNOWN' as current_state,
+        NULL as warehouse_comment,
+        COALESCE(ru.query_count, 0) as queries_last_7d,
         ru.avg_seconds_between_queries,
         ru.median_seconds_between_queries,
-        itw.idle_credits_last_7d,
-        w.created_on as warehouse_created,
-        w.owner as warehouse_owner
-    FROM snowflake.account_usage.warehouses w
-    LEFT JOIN recent_usage ru ON w.name = ru.warehouse_name
-    LEFT JOIN idle_time_waste itw ON w.name = itw.warehouse_name
-    WHERE w.deleted IS NULL
-    ORDER BY itw.idle_credits_last_7d DESC NULLS LAST
+        COALESCE(itw.idle_credits_last_7d, 0) as idle_credits_last_7d,
+        wm.first_seen as warehouse_created,
+        NULL as warehouse_owner
+    FROM warehouse_metadata wm
+    FULL OUTER JOIN recent_usage ru ON wm.warehouse_name = ru.warehouse_name
+    FULL OUTER JOIN idle_time_waste itw ON COALESCE(wm.warehouse_name, ru.warehouse_name) = itw.warehouse_name
+    ORDER BY idle_credits_last_7d DESC NULLS LAST
     """
 
     df = sf.execute_query(query)

@@ -38,32 +38,32 @@ def analyze_scaling_requirements(sf: SnowflakeConnection, warehouse_name: str = 
     query = f"""
     WITH hourly_concurrency AS (
         SELECT
-            warehouse_name,
-            DATE_TRUNC('hour', start_time) as hour,
-            HOUR(start_time) as hour_of_day,
-            DAYNAME(start_time) as day_of_week,
-            MAX(avg_running) as peak_concurrent,
-            AVG(avg_running) as avg_concurrent,
-            SUM(avg_queued_load) as total_queued,
-            SUM(avg_queued_provisioning) as provisioning_queued,
+            qh.warehouse_name,
+            DATE_TRUNC('hour', qh.start_time) as hour,
+            HOUR(qh.start_time) as hour_of_day,
+            DAYNAME(qh.start_time) as day_of_week,
+            COUNT(DISTINCT qh.query_id) as concurrent_queries,
             COUNT(*) as intervals_with_activity
-        FROM snowflake.account_usage.warehouse_metering_history
-        WHERE start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
-        {warehouse_filter}
-        GROUP BY warehouse_name, DATE_TRUNC('hour', start_time), HOUR(start_time), DAYNAME(start_time)
+        FROM snowflake.account_usage.query_history qh
+        WHERE qh.start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
+            AND qh.warehouse_name IS NOT NULL
+            {warehouse_filter}
+        GROUP BY qh.warehouse_name, DATE_TRUNC('hour', qh.start_time), HOUR(qh.start_time), DAYNAME(qh.start_time)
     ),
     warehouse_config AS (
         SELECT
-            name as warehouse_name,
-            size as warehouse_size,
-            type as warehouse_type,
-            min_cluster_count,
-            max_cluster_count,
-            scaling_policy,
-            auto_suspend,
-            auto_resume
-        FROM snowflake.account_usage.warehouses
-        WHERE deleted IS NULL
+            qh.warehouse_name,
+            MAX(qh.warehouse_size) as warehouse_size,
+            'STANDARD' as warehouse_type,
+            1 as min_cluster_count,
+            1 as max_cluster_count,
+            'STANDARD' as scaling_policy,
+            NULL as auto_suspend,
+            NULL as auto_resume
+        FROM snowflake.account_usage.query_history qh
+        WHERE qh.start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
+            AND qh.warehouse_name IS NOT NULL
+        GROUP BY qh.warehouse_name
     )
     SELECT
         hc.warehouse_name,
@@ -73,22 +73,22 @@ def analyze_scaling_requirements(sf: SnowflakeConnection, warehouse_name: str = 
         wc.max_cluster_count,
         wc.scaling_policy,
 
-        -- Overall concurrency stats
-        MAX(hc.peak_concurrent) as absolute_peak_concurrent,
-        AVG(hc.peak_concurrent) as avg_peak_concurrent,
-        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY hc.peak_concurrent) as p95_concurrent,
-        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY hc.peak_concurrent) as p99_concurrent,
+        -- Overall concurrency stats (based on query counts per hour)
+        MAX(hc.concurrent_queries) as absolute_peak_concurrent,
+        AVG(hc.concurrent_queries) as avg_peak_concurrent,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY hc.concurrent_queries) as p95_concurrent,
+        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY hc.concurrent_queries) as p99_concurrent,
 
-        -- Queue stats
-        SUM(CASE WHEN hc.total_queued > 0 THEN 1 ELSE 0 END) as hours_with_queuing,
-        AVG(CASE WHEN hc.total_queued > 0 THEN hc.total_queued ELSE NULL END) as avg_queued_when_queuing,
-        MAX(hc.total_queued) as max_queued,
+        -- Queue stats (not available, set to 0)
+        0 as hours_with_queuing,
+        0 as avg_queued_when_queuing,
+        0 as max_queued,
 
         -- Time-based patterns
-        AVG(CASE WHEN hc.hour_of_day BETWEEN 9 AND 17 THEN hc.peak_concurrent ELSE NULL END) as business_hours_peak,
-        AVG(CASE WHEN hc.hour_of_day NOT BETWEEN 9 AND 17 THEN hc.peak_concurrent ELSE NULL END) as off_hours_peak,
-        AVG(CASE WHEN hc.day_of_week IN ('Mon', 'Tue', 'Wed', 'Thu', 'Fri') THEN hc.peak_concurrent ELSE NULL END) as weekday_peak,
-        AVG(CASE WHEN hc.day_of_week IN ('Sat', 'Sun') THEN hc.peak_concurrent ELSE NULL END) as weekend_peak,
+        AVG(CASE WHEN hc.hour_of_day BETWEEN 9 AND 17 THEN hc.concurrent_queries ELSE NULL END) as business_hours_peak,
+        AVG(CASE WHEN hc.hour_of_day NOT BETWEEN 9 AND 17 THEN hc.concurrent_queries ELSE NULL END) as off_hours_peak,
+        AVG(CASE WHEN hc.day_of_week IN ('Mon', 'Tue', 'Wed', 'Thu', 'Fri') THEN hc.concurrent_queries ELSE NULL END) as weekday_peak,
+        AVG(CASE WHEN hc.day_of_week IN ('Sat', 'Sun') THEN hc.concurrent_queries ELSE NULL END) as weekend_peak,
 
         -- Activity patterns
         COUNT(DISTINCT hc.hour) as active_hours_total,
@@ -111,16 +111,16 @@ def generate_scaling_recommendations(df: pd.DataFrame) -> pd.DataFrame:
     for _, row in df.iterrows():
         warehouse = row['WAREHOUSE_NAME']
         warehouse_type = row['WAREHOUSE_TYPE']
-        current_min = row['MIN_CLUSTER_COUNT'] or 1
-        current_max = row['MAX_CLUSTER_COUNT'] or 1
+        current_min = int(row['MIN_CLUSTER_COUNT'] or 1)
+        current_max = int(row['MAX_CLUSTER_COUNT'] or 1)
         current_policy = row['SCALING_POLICY']
 
-        peak_concurrent = row['ABSOLUTE_PEAK_CONCURRENT']
-        p95_concurrent = row['P95_CONCURRENT']
-        avg_peak = row['AVG_PEAK_CONCURRENT']
+        peak_concurrent = float(row['ABSOLUTE_PEAK_CONCURRENT'])
+        p95_concurrent = float(row['P95_CONCURRENT'])
+        avg_peak = float(row['AVG_PEAK_CONCURRENT'])
 
-        hours_with_queuing = row['HOURS_WITH_QUEUING'] or 0
-        active_hours = row['ACTIVE_HOURS_TOTAL']
+        hours_with_queuing = float(row['HOURS_WITH_QUEUING'] or 0)
+        active_hours = float(row['ACTIVE_HOURS_TOTAL'])
         queue_percentage = (hours_with_queuing / active_hours * 100) if active_hours > 0 else 0
 
         # Determine if multi-cluster is needed
@@ -153,8 +153,8 @@ def generate_scaling_recommendations(df: pd.DataFrame) -> pd.DataFrame:
 
             # Determine scaling policy
             # Check workload variability
-            business_hours_peak = row['BUSINESS_HOURS_PEAK'] or 0
-            off_hours_peak = row['OFF_HOURS_PEAK'] or 0
+            business_hours_peak = float(row['BUSINESS_HOURS_PEAK'] or 0)
+            off_hours_peak = float(row['OFF_HOURS_PEAK'] or 0)
 
             if business_hours_peak > off_hours_peak * 2:
                 # Significant time-based variation - use Economy
@@ -194,8 +194,8 @@ def generate_scaling_recommendations(df: pd.DataFrame) -> pd.DataFrame:
         if business_hours_peak > off_hours_peak * 1.5:
             considerations.append("Significant business hours vs off-hours variation")
 
-        weekday_peak = row['WEEKDAY_PEAK'] or 0
-        weekend_peak = row['WEEKEND_PEAK'] or 0
+        weekday_peak = float(row['WEEKDAY_PEAK'] or 0)
+        weekend_peak = float(row['WEEKEND_PEAK'] or 0)
         if weekday_peak > weekend_peak * 1.5:
             considerations.append("Higher weekday load - consider scheduled scaling")
 

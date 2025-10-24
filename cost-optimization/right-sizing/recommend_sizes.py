@@ -42,18 +42,15 @@ def analyze_warehouse_patterns(sf: SnowflakeConnection, warehouse_name: str = No
     query = f"""
     WITH hourly_usage AS (
         SELECT
-            warehouse_name,
-            warehouse_size,
-            DATE_TRUNC('hour', start_time) as hour,
-            SUM(credits_used) as credits_used,
-            MAX(avg_running) as peak_concurrent_queries,
-            AVG(avg_running) as avg_concurrent_queries,
-            SUM(avg_queued_load) as queued_queries,
-            SUM(avg_queued_provisioning) as queued_provisioning
-        FROM snowflake.account_usage.warehouse_metering_history
-        WHERE start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
+            wh.warehouse_name,
+            DATE_TRUNC('hour', wh.start_time) as hour,
+            SUM(wh.credits_used) as credits_used,
+            SUM(wh.credits_used_compute) as compute_credits,
+            SUM(wh.credits_used_cloud_services) as cloud_services_credits
+        FROM snowflake.account_usage.warehouse_metering_history wh
+        WHERE wh.start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
         {warehouse_filter}
-        GROUP BY warehouse_name, warehouse_size, DATE_TRUNC('hour', start_time)
+        GROUP BY wh.warehouse_name, DATE_TRUNC('hour', wh.start_time)
     ),
     query_metrics AS (
         SELECT
@@ -75,7 +72,7 @@ def analyze_warehouse_patterns(sf: SnowflakeConnection, warehouse_name: str = No
     )
     SELECT
         hu.warehouse_name,
-        hu.warehouse_size,
+        COALESCE(MAX(qh.warehouse_size), 'UNKNOWN') as warehouse_size,
         COUNT(DISTINCT hu.hour) as active_hours,
         AVG(hu.credits_used) as avg_credits_per_hour,
         STDDEV(hu.credits_used) as stddev_credits,
@@ -85,23 +82,39 @@ def analyze_warehouse_patterns(sf: SnowflakeConnection, warehouse_name: str = No
         PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY hu.credits_used) as p75_credits,
         PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY hu.credits_used) as p95_credits,
 
-        -- Concurrency metrics
-        MAX(hu.peak_concurrent_queries) as max_concurrent_queries,
-        AVG(hu.avg_concurrent_queries) as avg_concurrent_queries,
+        -- Credits breakdown
+        AVG(hu.compute_credits) as avg_compute_credits,
+        AVG(hu.cloud_services_credits) as avg_cloud_services_credits,
 
-        -- Queue metrics
-        SUM(CASE WHEN hu.queued_queries > 0 THEN 1 ELSE 0 END) as hours_with_queuing,
-        AVG(CASE WHEN hu.queued_queries > 0 THEN hu.queued_queries ELSE NULL END) as avg_queued_when_queuing,
-
-        -- Query performance
+        -- Query performance metrics
         AVG(qm.query_count) as avg_queries_per_hour,
         AVG(qm.avg_query_time_seconds) as avg_query_time_seconds,
         AVG(qm.p95_query_time) as avg_p95_query_time,
-        AVG(qm.avg_bytes_scanned) as avg_bytes_scanned
+        AVG(qm.avg_bytes_scanned) as avg_bytes_scanned,
+
+        -- Concurrency from query_history
+        MAX(qh_agg.max_concurrent) as max_concurrent_queries,
+        AVG(qh_agg.avg_concurrent) as avg_concurrent_queries
 
     FROM hourly_usage hu
-    LEFT JOIN query_metrics qm ON hu.warehouse_name = qm.warehouse_name AND hu.hour = qm.hour
-    GROUP BY hu.warehouse_name, hu.warehouse_size
+    LEFT JOIN query_metrics qm
+        ON hu.warehouse_name = qm.warehouse_name AND hu.hour = qm.hour
+    LEFT JOIN snowflake.account_usage.query_history qh
+        ON hu.warehouse_name = qh.warehouse_name
+        AND DATE_TRUNC('hour', qh.start_time) = hu.hour
+        AND qh.start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
+    LEFT JOIN (
+        SELECT
+            warehouse_name,
+            DATE_TRUNC('hour', start_time) as hour,
+            COUNT(*) as max_concurrent,
+            COUNT(*) as avg_concurrent
+        FROM snowflake.account_usage.query_history
+        WHERE start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
+            AND warehouse_name IS NOT NULL
+        GROUP BY warehouse_name, DATE_TRUNC('hour', start_time)
+    ) qh_agg ON hu.warehouse_name = qh_agg.warehouse_name AND hu.hour = qh_agg.hour
+    GROUP BY hu.warehouse_name
     ORDER BY avg_credits_per_hour DESC
     """
 
@@ -117,9 +130,9 @@ def generate_sizing_recommendations(df: pd.DataFrame) -> pd.DataFrame:
         current_size = row['WAREHOUSE_SIZE']
         current_credits = parse_warehouse_size(current_size)
 
-        avg_credits = row['AVG_CREDITS_PER_HOUR']
-        p95_credits = row['P95_CREDITS']
-        max_credits = row['MAX_CREDITS_PER_HOUR']
+        avg_credits = float(row['AVG_CREDITS_PER_HOUR'])
+        p95_credits = float(row['P95_CREDITS'])
+        max_credits = float(row['MAX_CREDITS_PER_HOUR'])
 
         # Determine recommendation based on multiple factors
         recommended_size = None
@@ -134,21 +147,12 @@ def generate_sizing_recommendations(df: pd.DataFrame) -> pd.DataFrame:
         p95_based_size = recommend_warehouse_size(p95_credits)
         p95_based_credits = parse_warehouse_size(p95_based_size)
 
-        # Factor 3: Check for queuing
-        has_queuing = row['HOURS_WITH_QUEUING'] > 0
-        queue_percentage = (row['HOURS_WITH_QUEUING'] / row['ACTIVE_HOURS']) * 100 if row['ACTIVE_HOURS'] > 0 else 0
-
-        # Factor 4: Check concurrency
-        high_concurrency = row['MAX_CONCURRENT_QUERIES'] > current_credits * 8  # Rule of thumb
+        # Factor 3: Check concurrency (if available)
+        max_concurrent = row.get('MAX_CONCURRENT_QUERIES', 0)
+        high_concurrency = max_concurrent > current_credits * 8 if pd.notna(max_concurrent) else False
 
         # Decision logic
-        if has_queuing and queue_percentage > 10:
-            # Significant queuing - don't downsize, possibly upsize
-            recommended_size = current_size if current_credits >= p95_based_credits else p95_based_size
-            rationale.append(f"Queuing detected in {queue_percentage:.1f}% of active hours")
-            confidence = "MEDIUM" if queue_percentage < 20 else "LOW"
-
-        elif high_concurrency:
+        if high_concurrency:
             # High concurrency - consider multi-cluster instead of sizing up
             recommended_size = p95_based_size
             rationale.append(f"High concurrency ({row['MAX_CONCURRENT_QUERIES']:.0f} queries)")
@@ -177,25 +181,28 @@ def generate_sizing_recommendations(df: pd.DataFrame) -> pd.DataFrame:
         savings_pct = credit_diff / current_credits if current_credits > 0 else 0
 
         # Calculate dollar impact (approximate)
-        total_credits_used = avg_credits * row['ACTIVE_HOURS']
+        total_credits_used = float(avg_credits) * float(row['ACTIVE_HOURS'])
         current_cost = calculate_cost(total_credits_used)
-        projected_cost = calculate_cost(total_credits_used * (recommended_credits / current_credits))
-        savings = current_cost - projected_cost
+
+        # Avoid division by zero for unknown warehouse sizes
+        if current_credits > 0:
+            projected_cost = calculate_cost(total_credits_used * (recommended_credits / current_credits))
+            savings = current_cost - projected_cost
+        else:
+            # For unknown sizes, estimate based on average usage
+            projected_cost = calculate_cost(recommended_credits * float(row['ACTIVE_HOURS']))
+            savings = current_cost - projected_cost
 
         # Additional considerations
         considerations = []
 
-        if row['HOURS_WITH_QUEUING'] == 0:
-            considerations.append("✓ No queuing issues")
-        else:
-            considerations.append(f"⚠ Queuing in {row['HOURS_WITH_QUEUING']} hours")
-
-        variability = (row['STDDEV_CREDITS'] / avg_credits) if avg_credits > 0 else 0
+        variability = (float(row['STDDEV_CREDITS']) / avg_credits) if avg_credits > 0 and pd.notna(row['STDDEV_CREDITS']) else 0
         if variability > 0.5:
             considerations.append("⚠ High workload variability")
             considerations.append("→ Consider auto-scaling policies")
 
-        if row['AVG_QUERIES_PER_HOUR'] < 10:
+        avg_queries = row.get('AVG_QUERIES_PER_HOUR', 0)
+        if avg_queries and avg_queries < 10:
             considerations.append("ℹ Low query volume")
             considerations.append("→ Consider consolidating with other warehouses")
 
@@ -208,15 +215,14 @@ def generate_sizing_recommendations(df: pd.DataFrame) -> pd.DataFrame:
             'avg_credits_used': avg_credits,
             'p95_credits_used': p95_credits,
             'max_credits_used': max_credits,
-            'active_hours': row['ACTIVE_HOURS'],
+            'active_hours': float(row['ACTIVE_HOURS']),
             'savings_pct': savings_pct,
             'estimated_savings': savings,
             'confidence': confidence,
             'rationale': ' | '.join(rationale),
             'considerations': ' | '.join(considerations),
-            'has_queuing': has_queuing,
-            'avg_concurrent': row['AVG_CONCURRENT_QUERIES'],
-            'max_concurrent': row['MAX_CONCURRENT_QUERIES']
+            'avg_concurrent': float(row['AVG_CONCURRENT_QUERIES']) if pd.notna(row.get('AVG_CONCURRENT_QUERIES')) else 0,
+            'max_concurrent': float(row['MAX_CONCURRENT_QUERIES']) if pd.notna(row.get('MAX_CONCURRENT_QUERIES')) else 0
         })
 
     return pd.DataFrame(recommendations)

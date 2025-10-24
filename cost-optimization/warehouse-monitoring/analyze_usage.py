@@ -60,33 +60,30 @@ def analyze_warehouse_utilization(sf: SnowflakeConnection, days: int = 30) -> pd
     """Analyze warehouse utilization and identify underutilized resources."""
     logger.info("Analyzing warehouse utilization patterns...")
 
+    # Get warehouse utilization metrics
     query = f"""
     SELECT
         wh.warehouse_name,
-        wh.warehouse_size,
+        COALESCE(MAX(qh.warehouse_size), 'UNKNOWN') as warehouse_size,
         COUNT(DISTINCT DATE_TRUNC('hour', wh.start_time)) as active_hours,
         SUM(wh.credits_used) as total_credits,
+        SUM(wh.credits_used_compute) as compute_credits,
+        SUM(wh.credits_used_cloud_services) as cloud_services_credits,
         AVG(wh.credits_used) as avg_credits_per_hour,
 
-        -- Query metrics
+        -- Query metrics from query_history
         COUNT(DISTINCT qh.query_id) as total_queries,
         AVG(qh.total_elapsed_time / 1000.0) as avg_query_seconds,
         MAX(qh.total_elapsed_time / 1000.0) as max_query_seconds,
-
-        -- Concurrency metrics
-        MAX(wh.avg_running) as max_concurrent_queries,
-        AVG(wh.avg_running) as avg_concurrent_queries,
-
-        -- Queue metrics
-        SUM(wh.avg_queued_load) as total_queued,
-        AVG(CASE WHEN wh.avg_queued_load > 0 THEN wh.avg_queued_load ELSE NULL END) as avg_queued_when_queuing
+        SUM(qh.total_elapsed_time / 1000.0) as total_query_seconds
 
     FROM snowflake.account_usage.warehouse_metering_history wh
     LEFT JOIN snowflake.account_usage.query_history qh
         ON wh.warehouse_name = qh.warehouse_name
         AND DATE_TRUNC('hour', wh.start_time) = DATE_TRUNC('hour', qh.start_time)
+        AND qh.start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
     WHERE wh.start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
-    GROUP BY wh.warehouse_name, wh.warehouse_size
+    GROUP BY wh.warehouse_name
     ORDER BY total_credits DESC
     """
 
@@ -137,6 +134,7 @@ def identify_optimization_opportunities(utilization_df: pd.DataFrame) -> pd.Data
                 'current': f"{format_percentage(utilization)} utilized",
                 'recommendation': 'Consider consolidating workloads or reducing size',
                 'potential_savings': format_currency(potential_savings),
+                'savings_value': potential_savings,  # Numeric value for sorting
                 'priority': 'HIGH'
             })
 
@@ -148,18 +146,8 @@ def identify_optimization_opportunities(utilization_df: pd.DataFrame) -> pd.Data
                 'current': f"{current_size}",
                 'recommendation': f"Resize to {recommended_size}",
                 'potential_savings': format_currency(potential_savings),
+                'savings_value': potential_savings,  # Numeric value for sorting
                 'priority': 'HIGH' if potential_savings > 500 else 'MEDIUM'
-            })
-
-        # High queue times
-        if pd.notna(row['AVG_QUEUED_WHEN_QUEUING']) and row['AVG_QUEUED_WHEN_QUEUING'] > 1:
-            opportunities.append({
-                'warehouse': warehouse,
-                'opportunity': 'Query Queuing',
-                'current': f"{row['AVG_QUEUED_WHEN_QUEUING']:.1f} avg queued",
-                'recommendation': 'Enable multi-cluster or increase size during peak hours',
-                'potential_savings': 'N/A (Performance issue)',
-                'priority': 'MEDIUM'
             })
 
     return pd.DataFrame(opportunities)
@@ -242,7 +230,7 @@ def generate_cost_report(cost_df: pd.DataFrame, utilization_df: pd.DataFrame,
         opp_table.add_column("Savings", justify="right")
         opp_table.add_column("Priority", justify="center")
 
-        top_opps = opportunities_df.nlargest(10, 'potential_savings', keep='first') if 'potential_savings' in opportunities_df else opportunities_df.head(10)
+        top_opps = opportunities_df.nlargest(10, 'savings_value', keep='first') if 'savings_value' in opportunities_df.columns else opportunities_df.head(10)
         for _, row in top_opps.iterrows():
             priority_color = "red" if row['priority'] == 'HIGH' else "yellow" if row['priority'] == 'MEDIUM' else "green"
             opp_table.add_row(
