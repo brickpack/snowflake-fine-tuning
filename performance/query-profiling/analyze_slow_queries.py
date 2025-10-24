@@ -18,7 +18,7 @@ from rich.table import Table
 from rich.panel import Panel
 from rich import print as rprint
 
-sys.path.append(str(Path(__file__).parent.parent.parent))
+sys.path.append(str(Path(__file__).parent.parent.parent / 'cost-optimization'))
 from snowflake_utils import (
     SnowflakeConnection,
     format_currency,
@@ -176,7 +176,7 @@ def generate_optimization_recommendations(df: pd.DataFrame) -> pd.DataFrame:
                 'query_id': query_id,
                 'issue': 'Remote Disk Spilling',
                 'severity': 'CRITICAL',
-                'impact': f"{row['TOTAL_SECONDS']:.0f}s execution time',
+                'impact': f"{row['TOTAL_SECONDS']:.0f}s execution time",
                 'recommendations': [
                     "1. Increase warehouse size for more memory",
                     "2. Add WHERE clauses to reduce data processed",

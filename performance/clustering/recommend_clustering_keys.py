@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
-sys.path.append(str(Path(__file__).parent.parent.parent))
+sys.path.append(str(Path(__file__).parent.parent.parent / 'cost-optimization'))
 from snowflake_utils import (
     SnowflakeConnection,
     format_currency,
@@ -105,7 +105,7 @@ def analyze_table_access_patterns(sf: SnowflakeConnection, database: str = None,
 
         -- Column usage (simplified - in practice would need query parsing)
         -- This is a placeholder for demonstration
-        LISTAGG(DISTINCT ti.column_name, ', ') WITHIN GROUP (ORDER BY ti.ordinal_position) as table_columns
+        LISTAGG(DISTINCT ti.column_name, ', ') as table_columns
 
     FROM table_info ti
     LEFT JOIN query_filters qf
