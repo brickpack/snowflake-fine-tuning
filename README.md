@@ -4,7 +4,7 @@ A comprehensive repository for Snowflake cost optimization, performance tuning, 
 
 ## What's New
 
-**Latest Updates (2025)**:
+**Latest Updates **:
 
 - ✅ **MFA Support**: All scripts now support key-pair authentication for MFA-enabled accounts
 - ✅ **New Script**: `explain_plan.py` - Deep query execution plan analysis with performance recommendations
