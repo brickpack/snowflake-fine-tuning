@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.prompt import Confirm
 
-sys.path.append(str(Path(__file__).parent.parent.parent))
+sys.path.append(str(Path(__file__).parent.parent.parent / 'cost-optimization'))
 from snowflake_utils import (
     SnowflakeConnection,
     logger
@@ -96,12 +96,14 @@ def get_untagged_resources(sf: SnowflakeConnection, resource_type: str = 'wareho
         query = """
         SELECT
             'WAREHOUSE' as resource_type,
-            name as resource_name,
-            size as warehouse_size,
-            owner,
-            created_on
-        FROM snowflake.account_usage.warehouses
-        WHERE deleted IS NULL
+            qh.warehouse_name as resource_name,
+            MAX(qh.warehouse_size) as warehouse_size,
+            NULL as owner,
+            MIN(qh.start_time) as created_on
+        FROM snowflake.account_usage.query_history qh
+        WHERE qh.warehouse_name IS NOT NULL
+            AND qh.start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+        GROUP BY qh.warehouse_name
         """
     elif resource_type == 'database':
         query = """

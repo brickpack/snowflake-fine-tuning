@@ -15,7 +15,7 @@ import pandas as pd
 import numpy as np
 from rich.console import Console
 
-sys.path.append(str(Path(__file__).parent.parent.parent))
+sys.path.append(str(Path(__file__).parent.parent.parent / 'cost-optimization'))
 from snowflake_utils import (
     SnowflakeConnection,
     calculate_cost,
@@ -68,6 +68,10 @@ def detect_cost_anomalies(sf: SnowflakeConnection, lookback_hours: int = 24) -> 
     """
 
     df = sf.execute_query(query)
+
+    if df.empty:
+        return df
+
     df['cost'] = df['CREDITS_USED'].apply(calculate_cost)
 
     return df[df['ANOMALY_LEVEL'].isin(['CRITICAL', 'WARNING'])]
